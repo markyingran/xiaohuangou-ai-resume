@@ -1,6 +1,40 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+type InviteConfig = {
+  code: string;
+  maxGenerations?: number;
+};
+
+const INVITE_CONFIGS: InviteConfig[] = (() => {
+  const raw = process.env.NEXT_PUBLIC_INVITE_CODES || "";
+  if (!raw) return [];
+
+  return raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => {
+      const [code, limitStr] = item.split(":").map((v) => v.trim());
+      const maxGenerations = limitStr ? Number(limitStr) : undefined;
+      return {
+        code,
+        maxGenerations:
+          typeof maxGenerations === "number" && !Number.isNaN(maxGenerations)
+            ? maxGenerations
+            : undefined
+      };
+    });
+})();
+
+const findInviteConfig = (code: string | null): InviteConfig | undefined => {
+  if (!code) return undefined;
+  return INVITE_CONFIGS.find((c) => c.code === code);
+};
+
+const INVITE_STORAGE_KEY = "xiaohuangou_invite_code";
+const inviteUsageKey = (code: string) => `xiaohuangou_invite_used_${code}`;
 
 type ChatMessage = {
   id: number;
@@ -48,6 +82,14 @@ export default function HomePage() {
     string | null
   >(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generateSeconds, setGenerateSeconds] = useState(0);
+
+  // 邀请码相关状态
+  const [inviteChecked, setInviteChecked] = useState(false);
+  const [inviteCode, setInviteCode] = useState<string | null>(null);
+  const [inviteInput, setInviteInput] = useState("");
+  const [inviteError, setInviteError] = useState<string | null>(null);
+  const [inviteUsedCount, setInviteUsedCount] = useState(0);
 
   const hasJD = jdText.trim().length > 0;
   const hasPersonalInfo = !!uploadedResumeName || hasUserProvidedExperience;
@@ -57,6 +99,147 @@ export default function HomePage() {
     () => resumeVersions.find((v) => v.id === activeVersionId) ?? null,
     [resumeVersions, activeVersionId]
   );
+
+  useEffect(() => {
+    if (!isGenerating) {
+      setGenerateSeconds(0);
+      return;
+    }
+
+    const start = Date.now();
+    const timer = window.setInterval(() => {
+      const diffSeconds = Math.floor((Date.now() - start) / 1000);
+      setGenerateSeconds(diffSeconds);
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isGenerating]);
+
+  // 初始化时检查本地是否已有通过校验的邀请码
+  useEffect(() => {
+    if (!INVITE_CONFIGS.length) {
+      // 如果没有配置任何邀请码，则视为无需校验
+      setInviteChecked(true);
+      setInviteCode(null);
+      return;
+    }
+
+    try {
+      const saved = window.localStorage.getItem(INVITE_STORAGE_KEY);
+      if (saved) {
+        const cfg = findInviteConfig(saved);
+        if (cfg) {
+          const usedRaw = window.localStorage.getItem(inviteUsageKey(saved));
+          const used = usedRaw ? Number(usedRaw) : 0;
+          if (!cfg.maxGenerations || used < cfg.maxGenerations) {
+            setInviteCode(saved);
+            setInviteUsedCount(used);
+            setInviteChecked(true);
+            return;
+          }
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
+
+    setInviteChecked(true);
+  }, []);
+
+  const handleSubmitInvite = () => {
+    const code = inviteInput.trim();
+    if (!code) {
+      setInviteError("请输入邀请码");
+      return;
+    }
+
+    const cfg = findInviteConfig(code);
+    if (!cfg) {
+      setInviteError("邀请码无效，请确认后再试");
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(INVITE_STORAGE_KEY, code);
+      window.localStorage.setItem(inviteUsageKey(code), "0");
+    } catch {
+      // ignore storage errors
+    }
+
+    setInviteCode(code);
+    setInviteUsedCount(0);
+    setInviteError(null);
+  };
+
+  const checkInviteQuotaBeforeGenerate = (): boolean => {
+    if (!INVITE_CONFIGS.length) return true;
+    const code = inviteCode;
+    if (!code) {
+      window.alert("请先输入有效的邀请码后再使用生成简历功能。");
+      return false;
+    }
+    const cfg = findInviteConfig(code);
+    if (!cfg) {
+      window.alert("当前邀请码已失效，请联系小黄狗获取新的邀请码。");
+      return false;
+    }
+    if (!cfg.maxGenerations) return true;
+    try {
+      const usedRaw = window.localStorage.getItem(inviteUsageKey(code));
+      const used = usedRaw ? Number(usedRaw) : 0;
+      if (used >= cfg.maxGenerations) {
+        window.alert(
+          `该邀请码已达到可生成简历的上限（${cfg.maxGenerations} 次），如需继续使用，请联系小黄狗获取新的邀请码。`
+        );
+        return false;
+      }
+    } catch {
+      // ignore and allow
+    }
+    return true;
+  };
+
+  const increaseInviteUsageAfterGenerate = () => {
+    if (!INVITE_CONFIGS.length) return;
+    const code = inviteCode;
+    if (!code) return;
+    try {
+      const key = inviteUsageKey(code);
+      const usedRaw = window.localStorage.getItem(key);
+      const used = usedRaw ? Number(usedRaw) : 0;
+      const next = used + 1;
+      window.localStorage.setItem(key, String(next));
+      setInviteUsedCount(next);
+    } catch {
+      // ignore
+    }
+  };
+
+  const inviteRemaining = (() => {
+    if (!inviteCode || !INVITE_CONFIGS.length) return null;
+    const cfg = findInviteConfig(inviteCode);
+    if (!cfg || cfg.maxGenerations == null) return null;
+    return Math.max(0, cfg.maxGenerations - inviteUsedCount);
+  })();
+
+  const formatResumeContent = (raw: string) => {
+    // 先做基本的 HTML 转义，避免用户内容中的特殊字符打断结构
+    const escaped = raw
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+    // 将 [[AI新增]]...[[/AI新增]] 包裹的内容高亮显示
+    const highlighted = escaped.replace(
+      /\[\[AI新增\]\]([\s\S]*?)\[\[\/AI新增\]\]/g,
+      '<mark class="bg-yellow-300 text-black px-0.5 rounded-sm">$1</mark>'
+    );
+
+    // 将换行转换为 <br>，以保持原有排版
+    return highlighted.replace(/\n/g, "<br />");
+  };
 
   const handleSaveJd = () => {
     if (!jdText.trim()) {
@@ -184,6 +367,10 @@ export default function HomePage() {
       return;
     }
 
+    if (!checkInviteQuotaBeforeGenerate()) {
+      return;
+    }
+
     const key = todayKey();
     let nextIndex = generationCountToday + 1;
     if (lastGenerationDateKey !== key) {
@@ -250,17 +437,59 @@ export default function HomePage() {
     setGenerationCountToday(nextIndex);
     setLastGenerationDateKey(key);
     setIsGenerating(false);
+    increaseInviteUsageAfterGenerate();
   };
 
-  const handleExportResume = () => {
+  const handleExportResume = async () => {
     if (!activeVersion) {
       window.alert("请先生成一份简历");
       return;
     }
 
-    window.alert(
-      `当前 demo 暂未接入真实导出功能。\n你可以先复制预览中的内容，或使用浏览器的打印/另存为 PDF 功能导出。\n\n导出版本：${activeVersion.label}`
-    );
+    try {
+      const [{ Document, Packer, Paragraph, TextRun }] = await Promise.all([
+        import("docx")
+      ]);
+
+      const plainText = activeVersion.content
+        .replace(/\[\[AI新增\]\]/g, "")
+        .replace(/\[\[\/AI新增\]\]/g, "");
+
+      const lines = plainText.split("\n");
+      const paragraphs = lines.map((line) =>
+        new Paragraph({
+          children: [new TextRun(line)],
+          spacing: { after: 120 }
+        })
+      );
+
+      const doc = new Document({
+        sections: [
+          {
+            properties: {},
+            children: paragraphs
+          }
+        ]
+      });
+
+      const blob = await Packer.toBlob(doc);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const safeLabel = activeVersion.label.replace(/[^\u4e00-\u9fa5\w\-]/g, "_");
+
+      a.href = url;
+      a.download = `小黄狗AI改简历_${safeLabel}.docx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("导出简历为 Word 失败：", error);
+      window.alert(
+        "导出简历为 Word 文件失败，请稍后重试，或先复制内容到本地文档中保存。"
+      );
+    }
   };
 
   const [showResetConfirm, setShowResetConfirm] = useState(false);
@@ -287,6 +516,21 @@ export default function HomePage() {
     setShowResetConfirm(false);
   };
 
+  const handleLogout = () => {
+    try {
+      if (inviteCode) {
+        window.localStorage.removeItem(INVITE_STORAGE_KEY);
+        window.localStorage.removeItem(inviteUsageKey(inviteCode));
+      }
+    } catch {
+      // ignore storage errors
+    }
+    setInviteCode(null);
+    setInviteUsedCount(0);
+    setInviteInput("");
+    setInviteError(null);
+  };
+
   const generateButtonClassName =
     "px-4 py-2.5 rounded-md text-xs font-medium transition-colors " +
     (canGenerate && !isGenerating
@@ -298,6 +542,56 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
+      {/* 邀请码校验层（如果配置了邀请码且当前尚未通过校验） */}
+      {inviteChecked && INVITE_CONFIGS.length > 0 && !inviteCode && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center backdrop-blur-xl bg-slate-900/70">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-sm p-6">
+            <h1 className="text-base font-semibold text-slate-900 mb-2">
+              请输入邀请码后开始使用
+            </h1>
+            <p className="text-xs text-slate-500 mb-4">
+              小黄狗目前处于内测阶段，仅向受邀用户开放体验。请输入你收到的邀请码，每个邀请码可使用的生成次数有限，请珍惜使用。
+            </p>
+            <input
+              type="text"
+              className="w-full text-sm rounded-md border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-slate-900"
+              placeholder="在这里输入邀请码"
+              value={inviteInput}
+              onChange={(e) => {
+                setInviteInput(e.target.value);
+                if (inviteError) setInviteError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  handleSubmitInvite();
+                }
+              }}
+            />
+            {inviteError && (
+              <p className="mt-2 text-[11px] text-red-600">{inviteError}</p>
+            )}
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                className="px-3 py-1.5 rounded-md text-xs border border-slate-300 text-slate-700 hover:bg-slate-100"
+                onClick={() => {
+                  setInviteInput("");
+                  setInviteError(null);
+                }}
+              >
+                清空
+              </button>
+              <button
+                type="button"
+                className="px-3 py-1.5 rounded-md text-xs bg-slate-900 text-white hover:bg-slate-800"
+                onClick={handleSubmitInvite}
+              >
+                确认进入
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* 顶部标题栏 */}
       <header className="flex items-center justify-between px-8 py-4 border-b border-slate-200 bg-white">
         <div className="flex items-center gap-3">
@@ -319,12 +613,22 @@ export default function HomePage() {
           </div>
         </div>
 
-        <button
-          className="text-sm px-4 py-2 rounded-md border border-slate-300 hover:bg-slate-100 transition-colors"
-          onClick={() => setShowResetConfirm(true)}
-        >
-          清空重新来
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            className="text-sm px-4 py-2 rounded-md border border-slate-300 hover:bg-slate-100 transition-colors"
+            onClick={() => setShowResetConfirm(true)}
+          >
+            清空重新来
+          </button>
+          {INVITE_CONFIGS.length > 0 && inviteCode && (
+            <button
+              className="text-sm px-4 py-2 rounded-md border border-red-200 text-red-600 hover:bg-red-50 transition-colors"
+              onClick={handleLogout}
+            >
+              退出登录
+            </button>
+          )}
+        </div>
       </header>
 
       {/* 主体三区布局：左 C 区，右 A/B 区 */}
@@ -372,9 +676,19 @@ export default function HomePage() {
             <div className="flex-1 overflow-auto px-6 py-4 bg-slate-50">
               <div className="mx-auto max-w-3xl bg-white rounded-lg shadow-sm border border-slate-200 p-6">
                 {activeVersion ? (
-                  <pre className="whitespace-pre-wrap text-sm leading-relaxed text-slate-800">
-                    {activeVersion.content}
-                  </pre>
+                  <div className="space-y-2">
+                    <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-md px-3 py-2">
+                      生成简历中标黄部分是 AI 润色或补充的内容，请重点关注是否夸张或不准确，建议导出后再做一次人工确认和修改。
+                    </p>
+                    <div
+                      className="text-sm leading-relaxed text-slate-800"
+                      // 内容来自受信任的大模型输出，并经过简单转义和标记处理
+                      // eslint-disable-next-line react/no-danger
+                      dangerouslySetInnerHTML={{
+                        __html: formatResumeContent(activeVersion.content)
+                      }}
+                    />
+                  </div>
                 ) : (
                   <div className="text-sm text-slate-500 space-y-2">
                     <p className="font-medium text-slate-700">
@@ -396,7 +710,11 @@ export default function HomePage() {
                     className={generateButtonClassName}
                     onClick={handleGenerateResume}
                   >
-                    {isGenerating ? "生成中..." : "生成简历"}
+                    {isGenerating
+                      ? `生成中${generateSeconds}s`
+                      : inviteRemaining !== null
+                        ? `生成简历（剩余${inviteRemaining}次）`
+                        : "生成简历"}
                   </button>
                   <button
                     className={exportButtonClassName}
